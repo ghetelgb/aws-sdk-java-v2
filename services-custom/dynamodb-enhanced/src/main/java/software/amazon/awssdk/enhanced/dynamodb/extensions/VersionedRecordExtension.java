@@ -18,6 +18,7 @@ package software.amazon.awssdk.enhanced.dynamodb.extensions;
 import static software.amazon.awssdk.enhanced.dynamodb.internal.EnhancedClientUtils.isNullAttributeValue;
 import static software.amazon.awssdk.enhanced.dynamodb.internal.EnhancedClientUtils.keyRef;
 
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
@@ -27,10 +28,13 @@ import java.util.function.Function;
 import software.amazon.awssdk.annotations.NotThreadSafe;
 import software.amazon.awssdk.annotations.SdkPublicApi;
 import software.amazon.awssdk.annotations.ThreadSafe;
+import software.amazon.awssdk.enhanced.dynamodb.AttributeConverter;
 import software.amazon.awssdk.enhanced.dynamodb.AttributeValueType;
 import software.amazon.awssdk.enhanced.dynamodb.DynamoDbEnhancedClientExtension;
 import software.amazon.awssdk.enhanced.dynamodb.DynamoDbExtensionContext;
 import software.amazon.awssdk.enhanced.dynamodb.Expression;
+import software.amazon.awssdk.enhanced.dynamodb.TableMetadata;
+import software.amazon.awssdk.enhanced.dynamodb.TableSchema;
 import software.amazon.awssdk.enhanced.dynamodb.mapper.StaticAttributeTag;
 import software.amazon.awssdk.enhanced.dynamodb.mapper.StaticTableMetadata;
 import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
@@ -102,44 +106,55 @@ public final class VersionedRecordExtension implements DynamoDbEnhancedClientExt
         }
 
         Map<String, AttributeValue> itemToTransform = new HashMap<>(context.items());
-
-        String attributeKeyRef = keyRef(versionAttributeKey.get());
-        AttributeValue newVersionValue;
-        Expression condition;
-        Optional<AttributeValue> existingVersionValue =
-            Optional.ofNullable(itemToTransform.get(versionAttributeKey.get()));
-
-        if (!existingVersionValue.isPresent() || isNullAttributeValue(existingVersionValue.get())) {
-            // First version of the record
-            newVersionValue = AttributeValue.builder().n("1").build();
-            condition = Expression.builder()
-                                  .expression(String.format("attribute_not_exists(%s)", attributeKeyRef))
-                                  .expressionNames(Collections.singletonMap(attributeKeyRef, versionAttributeKey.get()))
-                                  .build();
-        } else {
-            // Existing record, increment version
-            if (existingVersionValue.get().n() == null) {
-                // In this case a non-null version attribute is present, but it's not an N
-                throw new IllegalArgumentException("Version attribute appears to be the wrong type. N is required.");
-            }
-
-            int existingVersion = Integer.parseInt(existingVersionValue.get().n());
-            String existingVersionValueKey = VERSIONED_RECORD_EXPRESSION_VALUE_KEY_MAPPER.apply(versionAttributeKey.get());
-            newVersionValue = AttributeValue.builder().n(Integer.toString(existingVersion + 1)).build();
-            condition = Expression.builder()
-                                  .expression(String.format("%s = %s", attributeKeyRef, existingVersionValueKey))
-                                  .expressionNames(Collections.singletonMap(attributeKeyRef, versionAttributeKey.get()))
-                                  .expressionValues(Collections.singletonMap(existingVersionValueKey,
-                                                                             existingVersionValue.get()))
-                                  .build();
-        }
-
-        itemToTransform.put(versionAttributeKey.get(), newVersionValue);
+        Expression condition = processItem(itemToTransform, context.tableMetadata(), versionAttributeKey.get());
 
         return WriteModification.builder()
                                 .transformedItem(Collections.unmodifiableMap(itemToTransform))
                                 .additionalConditionalExpression(condition)
                                 .build();
+    }
+
+    private Expression processItem(Map<String, AttributeValue> item, TableMetadata tableMetadata, String versionAttributeKey) {
+        String attributeKeyRef = keyRef(versionAttributeKey);
+        AttributeValue newVersionValue;
+        Expression condition;
+        Optional<AttributeValue> existingVersionValue = Optional.ofNullable(item.get(versionAttributeKey));
+
+        if (!existingVersionValue.isPresent() || isNullAttributeValue(existingVersionValue.get())) {
+            newVersionValue = AttributeValue.builder().n("1").build();
+            condition = Expression.builder()
+                                  .expression(String.format("attribute_not_exists(%s)", attributeKeyRef))
+                                  .expressionNames(Collections.singletonMap(attributeKeyRef, versionAttributeKey))
+                                  .build();
+        } else {
+            if (existingVersionValue.get().n() == null) {
+                throw new IllegalArgumentException("Version attribute appears to be the wrong type. N is required.");
+            }
+
+            int existingVersion = Integer.parseInt(existingVersionValue.get().n());
+            String existingVersionValueKey = VERSIONED_RECORD_EXPRESSION_VALUE_KEY_MAPPER.apply(versionAttributeKey);
+            newVersionValue = AttributeValue.builder().n(Integer.toString(existingVersion + 1)).build();
+            condition = Expression.builder()
+                                  .expression(String.format("%s = %s", attributeKeyRef, existingVersionValueKey))
+                                  .expressionNames(Collections.singletonMap(attributeKeyRef, versionAttributeKey))
+                                  .expressionValues(Collections.singletonMap(existingVersionValueKey, existingVersionValue.get()))
+                                  .build();
+        }
+
+        item.put(versionAttributeKey, newVersionValue);
+
+        for (Map.Entry<String, AttributeValue> entry : item.entrySet()) {
+            String key = entry.getKey();
+            AttributeValue value = entry.getValue();
+
+            if (value.hasM() && value.m() != null) {
+                Map<String, AttributeValue> nestedMap = new HashMap<>(value.m());
+                processItem(nestedMap, tableMetadata, versionAttributeKey);
+                item.put(key, AttributeValue.builder().m(nestedMap).build());
+            }
+        }
+
+        return condition;
     }
 
     @NotThreadSafe
